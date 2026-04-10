@@ -1,6 +1,9 @@
 /* 
   Prabha Agencies - Admin Script (V6 - Split Projects & Gallery)
 */
+import { collection, getDocs, addDoc, doc, updateDoc, deleteDoc, serverTimestamp } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
+import { db, storage } from "./src/firebase.js";
 
 document.addEventListener('DOMContentLoaded', () => {
     // Elements - Sections
@@ -35,11 +38,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const galleryCancelBtn = document.getElementById('gallery-cancel-btn');
     const adminGalleryList = document.getElementById('admin-gallery-list');
 
-    // State
     let currentProjectFiles = [];
     let currentGalleryFiles = [];
     let isProjectEditMode = false;
     let isGalleryEditMode = false;
+    window.cachedProjects = [];
+    window.cachedGallery = [];
 
     // 1. Session Management
     if (sessionStorage.getItem('admin_logged_in') === 'true') {
@@ -152,9 +156,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     window.editProject = async function(id) {
-        const res = await fetch('/api/data');
-        const dataFile = await res.json();
-        const item = (dataFile.projects || []).find(p => p.id == id);
+        const item = cachedProjects.find(p => p.id === id);
         if (item) {
             isProjectEditMode = true;
             projectEditingIdInput.value = item.id;
@@ -164,8 +166,9 @@ document.addEventListener('DOMContentLoaded', () => {
             projectFormTitle.textContent = "Edit Project";
             projectSubmitBtn.textContent = "Update Project";
             projectCancelBtn.style.display = "block";
+            // Pre-load current images mentally (won't show preview easily without fetching blobs, so just indicate they exist)
             currentProjectFiles = [];
-            renderPreviews(currentProjectFiles, projectPreviewBox, 'project', true);
+            projectPreviewBox.innerHTML = '<p style="color: #444; font-size: 0.9rem;">Keeping existing photos (' + (item.images?.length || 0) +'). Select new ones to replace.</p>';
             projectForm.scrollIntoView({ behavior: 'smooth' });
         }
     };
@@ -205,10 +208,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     window.editGallery = async function(id) {
-        const res = await fetch('/api/data');
-        const dataFile = await res.json();
-        const items = dataFile.gallery || [];
-        const item = items.find(g => g.id == id);
+        const item = cachedGallery.find(g => g.id === id);
         if (item) {
             isGalleryEditMode = true;
             galleryEditingIdInput.value = item.id;
@@ -219,7 +219,7 @@ document.addEventListener('DOMContentLoaded', () => {
             gallerySubmitBtn.textContent = "Update Gallery Item";
             galleryCancelBtn.style.display = "block";
             currentGalleryFiles = [];
-            renderPreviews(currentGalleryFiles, galleryPreviewBox, 'gallery', true);
+            galleryPreviewBox.innerHTML = '<p style="color: #444; font-size: 0.9rem;">Keeping existing photos (' + (item.images?.length || 0) +'). Select new ones to replace.</p>';
             galleryForm.scrollIntoView({ behavior: 'smooth' });
         }
     };
@@ -245,53 +245,61 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.textContent = 'Processing...';
 
         try {
-            const res = await fetch('/api/data');
-            const dataFile = await res.json();
-            let allItems = (type === 'projects' ? dataFile.projects : dataFile.gallery) || [];
             let finalImages = [];
 
             if (fileList.length > 0) {
-                const raws = await Promise.all(fileList.map(file => {
-                    return new Promise(r => {
-                        const reader = new FileReader();
-                        reader.onload = ev => r(ev.target.result);
-                        reader.readAsDataURL(file);
-                    });
+                finalImages = await Promise.all(fileList.map(async file => {
+                    const storageRef = ref(storage, `uploads/${Date.now()}-${file.name}`);
+                    await uploadBytes(storageRef, file);
+                    return await getDownloadURL(storageRef);
                 }));
-                finalImages = await Promise.all(raws.map(r => compressImage(r)));
+
+                // Cleanup old images if editing
+                if (isEdit) {
+                    const existing = (type === 'projects' ? window.cachedProjects : window.cachedGallery).find(i => i.id === data.editingId);
+                    if (existing && existing.images) {
+                        for (let url of existing.images) {
+                            if (url.includes('firebasestorage')) {
+                                deleteObject(ref(storage, url)).catch(e => console.log("Failed to clean up old image", e));
+                            }
+                        }
+                    }
+                }
             } else if (isEdit) {
-                const existing = allItems.find(i => i.id == data.editingId);
+                const existing = (type === 'projects' ? window.cachedProjects : window.cachedGallery).find(i => i.id === data.editingId);
                 finalImages = existing ? (existing.images || []) : [];
             } else {
                 alert(`Please select at least one image for a new ${label}!`);
+                btn.disabled = false;
+                btn.textContent = `Add ${label}`;
                 return;
             }
 
-            if (isEdit) {
-                const idx = allItems.findIndex(i => i.id == data.editingId);
-                if (idx !== -1) {
-                    allItems[idx] = { ...allItems[idx], title: data.title, description: data.desc, category: data.category, images: finalImages };
-                }
-            } else {
-                allItems.unshift({
-                    id: Date.now(),
-                    title: data.title,
-                    description: data.desc,
-                    category: data.category,
-                    images: finalImages,
-                    status: storageKeyAlias === 'projects' ? "Recently Added" : undefined
-                });
+            const docData = {
+                title: data.title,
+                description: data.desc,
+                category: data.category,
+                images: finalImages,
+                updatedAt: serverTimestamp()
+            };
+
+            if (type === 'projects' && !isEdit) {
+                docData.status = "Recently Added";
+                docData.createdAt = serverTimestamp();
+            } else if (!isEdit) {
+                docData.createdAt = serverTimestamp();
             }
 
-            await fetch('/api/data', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ type: type, items: allItems })
-            });
+            if (isEdit) {
+                await updateDoc(doc(db, type, data.editingId), docData);
+            } else {
+                await addDoc(collection(db, type), docData);
+            }
+
             alert(`${label} saved successfully!`);
         } catch (err) {
             console.error(err);
-            alert("Storage error! Try fewer or smaller images.");
+            alert("Storage error! Could not upload properly.");
         } finally {
             btn.disabled = false;
             btn.textContent = isEdit ? `Update ${label}` : `Add ${label}`;
@@ -300,17 +308,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 6. Admin Lists Rendering
     async function renderAdminProjects() {
-        const res = await fetch('/api/data');
-        const data = await res.json();
-        const projects = data.projects || [];
-        renderList(adminProjectsList, projects, 'editProject', 'projects', renderAdminProjects);
+        const snap = await getDocs(collection(db, "projects"));
+        window.cachedProjects = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        renderList(adminProjectsList, window.cachedProjects, 'editProject', 'projects', renderAdminProjects);
     }
 
     async function renderAdminGallery() {
-        const res = await fetch('/api/data');
-        const data = await res.json();
-        const gallery = data.gallery || [];
-        renderList(adminGalleryList, gallery, 'editGallery', 'gallery', renderAdminGallery);
+        const snap = await getDocs(collection(db, "gallery"));
+        window.cachedGallery = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        renderList(adminGalleryList, window.cachedGallery, 'editGallery', 'gallery', renderAdminGallery);
     }
 
     function renderList(container, items, editFunc, storageKey, refreshCallback) {
@@ -331,23 +337,32 @@ document.addEventListener('DOMContentLoaded', () => {
                     </div>
                 </div>
                 <div style="display: flex; gap: 10px;">
-                    <button onclick="${editFunc}(${item.id})" class="btn" style="background: #eef2ff; color: #4338ca; border: 1px solid #4338ca; padding: 5px 15px;">Edit</button>
+                    <button onclick="${editFunc}('${item.id}')" class="btn" style="background: #eef2ff; color: #4338ca; border: 1px solid #4338ca; padding: 5px 15px;">Edit</button>
                     <button class="btn del-btn" style="background: #fee2e2; color: #b91c1c; border: 1px solid #b91c1c; padding: 5px 15px;">Delete</button>
                 </div>
             `;
             
             div.querySelector('.del-btn').onclick = async () => {
                 if (confirm('Delete this item?')) {
-                    const res = await fetch('/api/data');
-                    const dataFile = await res.json();
-                    let allItems = (storageKey === 'projects' ? dataFile.projects : dataFile.gallery) || [];
-                    const filtered = allItems.filter(i => i.id != item.id);
-                    await fetch('/api/data', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ type: storageKey, items: filtered })
-                    });
-                    refreshCallback();
+                    const btn = div.querySelector('.del-btn');
+                    btn.disabled = true;
+                    btn.textContent = 'Deleting...';
+                    try {
+                        if (item.images && item.images.length) {
+                            for (let url of item.images) {
+                                if (url.includes('firebasestorage')) {
+                                    await deleteObject(ref(storage, url)).catch(e => console.log("Failed to clean up image on delete", e));
+                                }
+                            }
+                        }
+                        await deleteDoc(doc(db, storageKey, item.id));
+                        refreshCallback();
+                    } catch (err) {
+                        console.error(err);
+                        alert("Failed to delete item.");
+                        btn.disabled = false;
+                        btn.textContent = 'Delete';
+                    }
                 }
             };
             container.appendChild(div);
